@@ -132,9 +132,11 @@ export const parsePsdFile = async (file: File, options: PSDParseOptions = {}): P
 
       try {
         // Configure parsing options
+        // CRITICAL FIX: Explicitly enable useCanvas to ensure browser compatibility for pixel data
         const readOptions: ReadOptions = {
           skipLayerImageData: options.skipLayerImageData ?? false,
           skipThumbnail: options.skipThumbnail ?? true,
+          useCanvas: true 
         };
 
         // Attempt to parse the PSD

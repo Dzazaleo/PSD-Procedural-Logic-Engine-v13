@@ -3,7 +3,8 @@ import { Handle, Position, NodeProps, useEdges, useReactFlow } from 'reactflow';
 import { PSDNodeData, TransformedPayload, TransformedLayer, TemplateMetadata } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
 import { findLayerByPath } from '../services/psdService';
-import { Eye, CheckCircle2, Zap, Scan, Layers, AlertTriangle } from 'lucide-react';
+import { Layer } from 'ag-psd';
+import { Eye, CheckCircle2, Zap, Scan, Layers, AlertTriangle, Crosshair, BoxSelect } from 'lucide-react';
 
 interface PreviewInstanceRowProps {
   nodeId: string;
@@ -24,8 +25,22 @@ const countDeepLeaves = (layers: TransformedLayer[]): number => {
     return count;
 };
 
+// --- Helper: Binary Name Search Fallback ---
+const findLayerByName = (children: Layer[] | undefined, name: string): Layer | null => {
+    if (!children) return null;
+    for (const child of children) {
+        if (child.name === name) return child;
+        if (child.children) {
+            const found = findLayerByName(child.children, name);
+            if (found) return found;
+        }
+    }
+    return null;
+};
+
 const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, edges }) => {
   const [viewMode, setViewMode] = useState<'PROCEDURAL' | 'POLISHED'>('PROCEDURAL');
+  const [autoFrame, setAutoFrame] = useState(true); // Default to TRUE to ensure visibility
   const [localPreview, setLocalPreview] = useState<string | null>(null);
   
   // Store Access
@@ -62,7 +77,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
     }
   }, [displayPayload, nodeId, index, registerReviewerPayload]);
 
-  // 5. "FINAL SIGN-OFF" COMPOSITOR
+  // 5. "ABSOLUTE-LOCAL" COMPOSITOR
   useEffect(() => {
     if (!displayPayload) return;
 
@@ -76,6 +91,7 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
     }
 
     const { w, h } = displayPayload.metrics.target;
+    if (w === 0 || h === 0) return;
     
     const canvas = document.createElement('canvas');
     canvas.width = w;
@@ -83,123 +99,180 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // A. Background (Dark Slate)
-    ctx.fillStyle = '#0f172a';
-    ctx.fillRect(0, 0, w, h);
+    // A. Checkerboard Background (Transparency Grid)
+    const squareSize = 20;
+    const cols = Math.ceil(w / squareSize);
+    const rows = Math.ceil(h / squareSize);
+    
+    for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+            ctx.fillStyle = (r + c) % 2 === 0 ? '#1e293b' : '#334155'; // Dark Slate / Mid Slate
+            ctx.fillRect(c * squareSize, r * squareSize, squareSize, squareSize);
+        }
+    }
 
     // B. TARGET SPACE NORMALIZATION (Camera Positioning)
     let originX = 0;
     let originY = 0;
-    let originFound = false;
-
-    // Strategy 1: Template Metadata Lookup
-    const allTemplates = Object.values(templateRegistry) as TemplateMetadata[];
-    for (const tmpl of allTemplates) {
-        const container = tmpl.containers.find(c => 
-            c.name.toLowerCase() === displayPayload.targetContainer.toLowerCase()
-        );
-        if (container) {
-            originX = container.bounds.x;
-            originY = container.bounds.y;
-            originFound = true;
-            break;
-        }
-    }
-
-    // Strategy 2: Bounding Box Fallback (Auto-Frame)
-    // If metadata missing or origin is suspiciously 0 while layers are far out, scan for content.
-    if ((!originFound || (originX === 0 && originY === 0)) && displayPayload.layers.length > 0) {
-        let minX = Infinity;
-        let minY = Infinity;
-        
+    
+    // 1. Scan Content Bounds
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    
+    if (displayPayload.layers.length > 0) {
         const scanBounds = (layers: TransformedLayer[]) => {
             layers.forEach(l => {
                 if (l.isVisible) {
                     if (l.coords.x < minX) minX = l.coords.x;
                     if (l.coords.y < minY) minY = l.coords.y;
+                    if (l.coords.x + l.coords.w > maxX) maxX = l.coords.x + l.coords.w;
+                    if (l.coords.y + l.coords.h > maxY) maxY = l.coords.y + l.coords.h;
                     if (l.children) scanBounds(l.children);
                 }
             });
         };
-        
         scanBounds(displayPayload.layers);
-        
-        // Sanity Check: Only override if we found valid bounds
-        if (minX !== Infinity && minY !== Infinity) {
-            originX = minX;
-            originY = minY;
-            // console.log(`[Preview] Auto-Framed Origin to: ${originX}, ${originY}`);
+    }
+
+    // 2. Determine Camera Origin
+    if (autoFrame && minX !== Infinity) {
+        // Center the content in the viewport
+        const contentW = maxX - minX;
+        const contentH = maxY - minY;
+        originX = minX + (contentW - w) / 2;
+        originY = minY + (contentH - h) / 2;
+    } else {
+        // Strict Template Metadata Lookup
+        const allTemplates = Object.values(templateRegistry) as TemplateMetadata[];
+        for (const tmpl of allTemplates) {
+            const container = tmpl.containers.find(c => 
+                c.name.toLowerCase() === displayPayload.targetContainer.toLowerCase()
+            );
+            if (container) {
+                originX = container.bounds.x;
+                originY = container.bounds.y;
+                break;
+            }
         }
     }
 
-    console.log(`[Preview] Rendering '${displayPayload.targetContainer}' | Camera Origin: ${originX}, ${originY}`);
-
-    // C. DEEP RENDER TRAVERSAL
+    // D. FLATTENED RENDER TRAVERSAL
     const drawLayers = (layers: TransformedLayer[]) => {
-        // PAINTER'S ALGORITHM FIX:
-        // Iterate FORWARD (0 to length) assuming Index 0 is the Bottom-most layer (Background)
-        // and subsequent indices stack on top.
         for (let i = 0; i < layers.length; i++) {
             const layer = layers[i];
             
             if (layer.isVisible) {
-                // If group, recurse immediately
                 if (layer.children && layer.children.length > 0) {
                     drawLayers(layer.children);
                     continue; 
                 }
 
-                // --- Leaf Node Rendering ---
-                // Global to Local Space Transform
+                // Calculate Absolute-Local Coordinates
                 const localX = layer.coords.x - originX;
                 const localY = layer.coords.y - originY;
 
                 ctx.save();
                 
-                // 1. Generative/Synthetic Placeholder
+                // 1. Generative Placeholder
                 if (layer.type === 'generative') {
-                    ctx.fillStyle = 'rgba(192, 132, 252, 0.2)'; // Purple
+                    ctx.fillStyle = 'rgba(192, 132, 252, 0.4)';
                     ctx.strokeStyle = '#c084fc';
-                    ctx.setLineDash([4, 4]);
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([4, 2]);
                     ctx.fillRect(localX, localY, layer.coords.w, layer.coords.h);
                     ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
                 } 
                 // 2. Real Pixel Data
                 else if (sourcePsd) {
-                    const originalLayer = findLayerByPath(sourcePsd, layer.id);
+                    let originalLayer = findLayerByPath(sourcePsd, layer.id);
+                    if (!originalLayer) {
+                         originalLayer = findLayerByName(sourcePsd.children, layer.name);
+                    }
 
                     if (originalLayer && originalLayer.canvas) {
-                        ctx.globalAlpha = layer.opacity !== undefined ? layer.opacity : 1.0;
-                        
-                        // Handle Rotation / Anchors if present
-                        if (layer.transform.rotation) {
+                         // DEBUG: Draw Solid Mass Fill (Yellow/White Tint)
+                         // If you see this but no image, the image is transparent.
+                         ctx.fillStyle = 'rgba(255, 255, 100, 0.1)'; 
+                         ctx.fillRect(localX, localY, layer.coords.w, layer.coords.h);
+
+                         const alpha = Number.isFinite(layer.opacity) ? layer.opacity : 1.0;
+                         ctx.globalAlpha = alpha;
+                         
+                         if (layer.transform.rotation) {
                              const cx = localX + layer.coords.w / 2;
                              const cy = localY + layer.coords.h / 2;
                              ctx.translate(cx, cy);
                              ctx.rotate((layer.transform.rotation * Math.PI) / 180);
                              ctx.translate(-cx, -cy);
-                        }
+                         }
 
-                        try {
-                            ctx.drawImage(
-                                originalLayer.canvas, 
-                                localX, 
-                                localY, 
-                                layer.coords.w, 
-                                layer.coords.h
-                            );
-                        } catch (e) { /* Ignore canvas errors */ }
+                         // FIX: Define srcCanvas outside try block to be accessible in label logic
+                         const srcCanvas = originalLayer.canvas as HTMLCanvasElement;
+
+                         try {
+                            // Explicit Check for Valid Canvas
+                            if (srcCanvas.width > 0 && srcCanvas.height > 0) {
+                                ctx.drawImage(
+                                    srcCanvas, 
+                                    localX, 
+                                    localY, 
+                                    layer.coords.w, 
+                                    layer.coords.h
+                                );
+                            } else {
+                                // Empty Canvas Detected (e.g. Spacer Layer or Empty Mask)
+                                ctx.fillStyle = 'rgba(255, 0, 255, 0.2)'; // Magenta Debug Fill
+                                ctx.fillRect(localX, localY, layer.coords.w, layer.coords.h);
+                            }
+                         } catch (e) { 
+                             console.error("Canvas draw error", e);
+                             // Error drawing (tainted?)
+                             ctx.fillStyle = 'rgba(255, 0, 0, 0.5)'; // Red Fill
+                             ctx.fillRect(localX, localY, layer.coords.w, layer.coords.h);
+                             ctx.fillStyle = '#fff';
+                             ctx.font = '10px monospace';
+                             ctx.fillText("DRAW ERR", localX + 2, localY + 12);
+                         }
+
+                         // DEBUG: Cyan Border & Label
+                         ctx.globalAlpha = 1.0; 
+                         ctx.strokeStyle = '#06b6d4'; // Cyan
+                         ctx.lineWidth = 1;
+                         ctx.setLineDash([2, 2]);
+                         ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
+                         
+                         // Label logic
+                         if (layer.coords.h > 10) {
+                             ctx.fillStyle = '#06b6d4';
+                             ctx.font = '9px monospace';
+                             // Show name and source dimensions for debugging
+                             const dimLabel = srcCanvas ? ` (${srcCanvas.width}x${srcCanvas.height})` : '';
+                             ctx.fillText((originalLayer.name?.substring(0, 15) || 'Layer') + dimLabel, localX + 2, localY + 8);
+                         }
                     } else {
-                        // Binary Missing: Draw Magenta Wireframe to prove coordinate correctness
-                        ctx.strokeStyle = '#ff00ff'; // Magenta
-                        ctx.lineWidth = 1;
+                        // Missing Pixels
+                        ctx.globalAlpha = 1.0;
+                        ctx.strokeStyle = '#ef4444'; // Red
+                        ctx.lineWidth = 2;
                         ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
-                    }
-                }
+                        
+                        ctx.beginPath();
+                        ctx.moveTo(localX, localY);
+                        ctx.lineTo(localX + layer.coords.w, localY + layer.coords.h);
+                        ctx.stroke();
 
-                // Debug Border (Optional: To verify placement if image is blank)
-                // ctx.strokeStyle = 'rgba(255, 0, 255, 0.3)';
-                // ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
+                        ctx.fillStyle = '#ef4444';
+                        ctx.font = '10px monospace';
+                        ctx.fillText("NO PIXELS", localX + 2, localY + 12);
+                    }
+                } else {
+                    // Missing Binary Source
+                    ctx.globalAlpha = 1.0;
+                    ctx.fillStyle = 'rgba(255, 0, 0, 0.2)';
+                    ctx.fillRect(localX, localY, layer.coords.w, layer.coords.h);
+                }
 
                 ctx.restore();
             }
@@ -209,10 +282,19 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
     if (displayPayload.layers) {
         drawLayers(displayPayload.layers);
     }
+    
+    // Auto-Frame Indicator (Overlay)
+    if (autoFrame) {
+        ctx.save();
+        ctx.fillStyle = '#06b6d4';
+        ctx.font = '10px monospace';
+        ctx.fillText("AUTO-CENTER", 5, h - 5);
+        ctx.restore();
+    }
 
     setLocalPreview(canvas.toDataURL('image/jpeg', 0.9));
 
-  }, [displayPayload, psdRegistry, templateRegistry, globalVersion]);
+  }, [displayPayload, psdRegistry, templateRegistry, globalVersion, autoFrame]);
 
   // Deep Count for UI
   const leafCount = useMemo(() => {
@@ -231,40 +313,50 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
                 </span>
             </div>
             
-            {/* Toggle */}
-            <div className="flex bg-slate-900 rounded p-0.5 border border-slate-700">
+            {/* View Controls */}
+            <div className="flex space-x-2">
                 <button
-                    onClick={() => setViewMode('PROCEDURAL')}
-                    className={`px-3 py-1 rounded text-[9px] font-bold uppercase transition-all ${
-                        effectiveMode === 'PROCEDURAL' 
-                        ? 'bg-indigo-600 text-white shadow-sm' 
-                        : 'text-slate-500 hover:text-slate-300'
+                    onClick={() => setAutoFrame(!autoFrame)}
+                    className={`p-1 rounded border transition-colors ${
+                        autoFrame 
+                        ? 'bg-cyan-900/50 border-cyan-500/50 text-cyan-300' 
+                        : 'bg-slate-900 border-slate-700 text-slate-500'
                     }`}
+                    title={autoFrame ? "Auto-Center Enabled" : "Strict Template Coordinates"}
                 >
-                    <Zap className="w-3 h-3 inline mr-1" />
-                    Procedural
+                    <Crosshair className="w-3 h-3" />
                 </button>
-                <button
-                    onClick={() => setViewMode('POLISHED')}
-                    disabled={!isPolishedAvailable}
-                    className={`px-3 py-1 rounded text-[9px] font-bold uppercase transition-all ${
-                        effectiveMode === 'POLISHED' 
-                        ? 'bg-emerald-600 text-white shadow-sm' 
-                        : 'text-slate-600 cursor-not-allowed opacity-50'
-                    }`}
-                >
-                    <CheckCircle2 className="w-3 h-3 inline mr-1" />
-                    Polished
-                </button>
+
+                <div className="flex bg-slate-900 rounded p-0.5 border border-slate-700">
+                    <button
+                        onClick={() => setViewMode('PROCEDURAL')}
+                        className={`px-3 py-1 rounded text-[9px] font-bold uppercase transition-all ${
+                            effectiveMode === 'PROCEDURAL' 
+                            ? 'bg-indigo-600 text-white shadow-sm' 
+                            : 'text-slate-500 hover:text-slate-300'
+                        }`}
+                    >
+                        <Zap className="w-3 h-3 inline mr-1" />
+                        Raw
+                    </button>
+                    <button
+                        onClick={() => setViewMode('POLISHED')}
+                        disabled={!isPolishedAvailable}
+                        className={`px-3 py-1 rounded text-[9px] font-bold uppercase transition-all ${
+                            effectiveMode === 'POLISHED' 
+                            ? 'bg-emerald-600 text-white shadow-sm' 
+                            : 'text-slate-600 cursor-not-allowed opacity-50'
+                        }`}
+                    >
+                        <CheckCircle2 className="w-3 h-3 inline mr-1" />
+                        Final
+                    </button>
+                </div>
             </div>
         </div>
 
         {/* Canvas Stage */}
         <div className="relative w-full aspect-video bg-[#0f172a] rounded border border-slate-700/50 overflow-hidden flex items-center justify-center group">
-            <div className="absolute inset-0 opacity-10 pointer-events-none" 
-                 style={{ backgroundImage: 'radial-gradient(#334155 1px, transparent 1px)', backgroundSize: '10px 10px' }}>
-            </div>
-
             {localPreview ? (
                 <img 
                     src={localPreview} 
