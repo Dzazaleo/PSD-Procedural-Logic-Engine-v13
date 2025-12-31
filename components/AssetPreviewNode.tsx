@@ -66,17 +66,12 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
   useEffect(() => {
     if (!displayPayload) return;
 
-    // BINARY RECOVERY LOGIC:
-    // The payload.sourceNodeId often points to a Remapper/Reviewer which has no binary data.
-    // We must find the original 'LoadPSD' source.
-    // Strategy: Look up specific ID first, then fallback to scanning the registry for ANY valid PSD.
+    // BINARY RECOVERY LOGIC
     let sourcePsd = psdRegistry[displayPayload.sourceNodeId];
-    
     if (!sourcePsd) {
         const firstAvailableKey = Object.keys(psdRegistry)[0];
         if (firstAvailableKey) {
             sourcePsd = psdRegistry[firstAvailableKey];
-            // console.log(`[Preview] Binary recovery: Used fallback ${firstAvailableKey} for pixels.`);
         }
     }
 
@@ -88,18 +83,16 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    // A. Background (Dark Slate for Contrast)
+    // A. Background (Dark Slate)
     ctx.fillStyle = '#0f172a';
     ctx.fillRect(0, 0, w, h);
 
-    // B. TARGET SPACE NORMALIZATION
-    // The canvas represents the Target Container. 
-    // We must subtract the Container's Global Origin from every Layer's Global Coordinate.
+    // B. TARGET SPACE NORMALIZATION (Camera Positioning)
     let originX = 0;
     let originY = 0;
     let originFound = false;
 
-    // Search all templates for this container definition
+    // Strategy 1: Template Metadata Lookup
     const allTemplates = Object.values(templateRegistry) as TemplateMetadata[];
     for (const tmpl of allTemplates) {
         const container = tmpl.containers.find(c => 
@@ -113,42 +106,51 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
         }
     }
 
-    // Fallback: If metadata is missing, Auto-Frame to the top-leftmost layer
-    if (!originFound && displayPayload.layers.length > 0) {
+    // Strategy 2: Bounding Box Fallback (Auto-Frame)
+    // If metadata missing or origin is suspiciously 0 while layers are far out, scan for content.
+    if ((!originFound || (originX === 0 && originY === 0)) && displayPayload.layers.length > 0) {
         let minX = Infinity;
         let minY = Infinity;
-        const scanLayers = (layers: TransformedLayer[]) => {
+        
+        const scanBounds = (layers: TransformedLayer[]) => {
             layers.forEach(l => {
                 if (l.isVisible) {
                     if (l.coords.x < minX) minX = l.coords.x;
                     if (l.coords.y < minY) minY = l.coords.y;
-                    if (l.children) scanLayers(l.children);
+                    if (l.children) scanBounds(l.children);
                 }
             });
         };
-        scanLayers(displayPayload.layers);
-        if (minX !== Infinity) {
+        
+        scanBounds(displayPayload.layers);
+        
+        // Sanity Check: Only override if we found valid bounds
+        if (minX !== Infinity && minY !== Infinity) {
             originX = minX;
             originY = minY;
+            // console.log(`[Preview] Auto-Framed Origin to: ${originX}, ${originY}`);
         }
     }
 
+    console.log(`[Preview] Rendering '${displayPayload.targetContainer}' | Camera Origin: ${originX}, ${originY}`);
+
     // C. DEEP RENDER TRAVERSAL
     const drawLayers = (layers: TransformedLayer[]) => {
-        // Iterate BACKWARDS (length-1 to 0) to simulate Painter's Algorithm (Bottom Layers First)
-        // Assumption: 'layers' array is ordered [Top ... Bottom] (Photoshop standard)
-        for (let i = layers.length - 1; i >= 0; i--) {
+        // PAINTER'S ALGORITHM FIX:
+        // Iterate FORWARD (0 to length) assuming Index 0 is the Bottom-most layer (Background)
+        // and subsequent indices stack on top.
+        for (let i = 0; i < layers.length; i++) {
             const layer = layers[i];
             
             if (layer.isVisible) {
-                // If group, recurse immediately (don't draw the group folder itself)
+                // If group, recurse immediately
                 if (layer.children && layer.children.length > 0) {
                     drawLayers(layer.children);
                     continue; 
                 }
 
-                // --- Drawing Leaf Node ---
-                // Calculate Local Coordinates relative to the Target Container
+                // --- Leaf Node Rendering ---
+                // Global to Local Space Transform
                 const localX = layer.coords.x - originX;
                 const localY = layer.coords.y - originY;
 
@@ -167,9 +169,9 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
                     const originalLayer = findLayerByPath(sourcePsd, layer.id);
 
                     if (originalLayer && originalLayer.canvas) {
-                        ctx.globalAlpha = layer.opacity;
+                        ctx.globalAlpha = layer.opacity !== undefined ? layer.opacity : 1.0;
                         
-                        // Apply Transforms
+                        // Handle Rotation / Anchors if present
                         if (layer.transform.rotation) {
                              const cx = localX + layer.coords.w / 2;
                              const cy = localY + layer.coords.h / 2;
@@ -179,8 +181,6 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
                         }
 
                         try {
-                            // Draw Image scaled to the Layer's Current Dimensions
-                            // This preserves the Remapper's scaling logic visually
                             ctx.drawImage(
                                 originalLayer.canvas, 
                                 localX, 
@@ -188,14 +188,18 @@ const PreviewInstanceRow: React.FC<PreviewInstanceRowProps> = ({ nodeId, index, 
                                 layer.coords.w, 
                                 layer.coords.h
                             );
-                        } catch (e) { /* Ignore canvas read errors */ }
+                        } catch (e) { /* Ignore canvas errors */ }
                     } else {
-                        // Binary Missing Indicator (Wireframe)
-                        ctx.strokeStyle = '#ef4444'; // Red
+                        // Binary Missing: Draw Magenta Wireframe to prove coordinate correctness
+                        ctx.strokeStyle = '#ff00ff'; // Magenta
                         ctx.lineWidth = 1;
                         ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
                     }
                 }
+
+                // Debug Border (Optional: To verify placement if image is blank)
+                // ctx.strokeStyle = 'rgba(255, 0, 255, 0.3)';
+                // ctx.strokeRect(localX, localY, layer.coords.w, layer.coords.h);
 
                 ctx.restore();
             }
